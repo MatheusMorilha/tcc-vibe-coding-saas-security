@@ -1,0 +1,17 @@
+# 1. Python & Ambientes Virtuais
+__pycache__/
+*.pyc
+.venv/
+env/
+venv/
+
+# 2. Caches de Ferramentas SAST (Importante: Não ignora os relatórios JSON)
+.scannerwork/
+.sonar/
+.semgrep/
+.snyk/
+
+# 3. Arquivos de Sistema e Logs
+*.log
+.DS_Store
+Thumbs.db
