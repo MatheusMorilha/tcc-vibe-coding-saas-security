@@ -121,10 +121,25 @@ def processar_snyk(caminho_json):
     return achados
 
 def consolidar_e_exportar(lote_pasta, nome_saida):
+    # Define o nome e o caminho do arquivo final que será gerado
+    caminho_excel = os.path.join(lote_pasta, f"matriz_rastreabilidade_{nome_saida}.xlsx")
+    
+    # ==================================================================
+    # MEDIDA DE SEGURANÇA: Prevenir sobrescrita da Matriz (Protege a Triagem)
+    # ==================================================================
+    if os.path.exists(caminho_excel):
+        print(f"\n⚠️ AVISO: A matriz para o cenário '{nome_saida}' já foi extraída!")
+        print(f"O arquivo '{caminho_excel}' já existe nesta pasta.")
+        print("Modo de segurança: Extração abortada para não sobrescrever dados ou triagens manuais.\n")
+        return
+
     print(f"Iniciando consolidação do lote: {lote_pasta}...")
+    
+    # Define os caminhos dos relatórios
     semgrep_json = os.path.join(lote_pasta, "resultado_semgrep.json")
     snyk_json = os.path.join(lote_pasta, "resultado_snyk.json")
     
+    # Chama as funções de extração (que você já tem prontas)
     dados_totais = processar_semgrep(semgrep_json) + processar_snyk(snyk_json)
     
     if not dados_totais:
@@ -140,7 +155,8 @@ def consolidar_e_exportar(lote_pasta, nome_saida):
         "ID CWE", "Categoria OWASP 2025", "Severidade Normalizada", "Desfecho Triagem"
     ]
     df = df[colunas_ordem]
-    caminho_excel = os.path.join(lote_pasta, f"matriz_rastreabilidade_{nome_saida}.xlsx")
+    
+    # Exporta o arquivo blindado
     df.to_excel(caminho_excel, index=False)
     print(f"Sucesso! Matriz exportada para: {caminho_excel}")
 
