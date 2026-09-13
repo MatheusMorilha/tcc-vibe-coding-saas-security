@@ -24,8 +24,17 @@ def executar_sast_no_cenario(caminho_cenario):
     print(f"==================================================\n")
 
     # 1. Executa Semgrep
+    # Ruleset fixo e explícito (em vez do modo "auto"): garante que o mesmo
+    # conjunto de regras seja usado em todos os cenários e que essa escolha
+    # fique registrada, conforme a exigência de reprodutibilidade do projeto.
+    # Ajuste esta lista uma única vez, no início da coleta, e não mude depois.
     print(" Running Semgrep...")
-    cmd_semgrep = 'semgrep scan --quiet --exclude="*.json" --json > resultado_semgrep.json'
+    cmd_semgrep = (
+        'semgrep scan --quiet --exclude="*.json" --json '
+        '--config=p/security-audit --config=p/owasp-top-ten --config=p/cwe-top-25 '
+        '--config=p/python --config=p/nodejs '
+        '> resultado_semgrep.json'
+    )
     subprocess.run(cmd_semgrep, shell=True, cwd=caminho_cenario)
 
     # 2. Executa Snyk Code

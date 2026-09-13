@@ -4,7 +4,7 @@ Repositório de execução do experimento: geração de código por assistentes 
 
 > **Regra de ouro:** todos os comandos são executados a partir da **raiz do repositório** (`tcc-vibe-coding-saas-security`).
 
-**Stack atual:** Semgrep + Snyk Code — SonarQube temporariamente fora do escopo.
+**Stack atual:** Semgrep + Snyk Code
 
 ---
 
@@ -238,7 +238,7 @@ python3 scripts/verificar_seguros.py amostras/controle/K01
 
 ## Versionamento
 
-O `.gitignore` ignora caches (`__pycache__/`, `.venv/`, `.semgrep/`, `.snyk/`, `.scannerwork/`, `.sonar/`), logs e arquivos de sistema.
+O `.gitignore` ignora caches (`__pycache__/`, `.venv/`, `.semgrep/`, `.snyk/`, `.scannerwork/`), logs e arquivos de sistema.
 
 **Os relatórios `.json` e as matrizes `.xlsx` são versionados de propósito** — são a evidência bruta do experimento e precisam estar no histórico do repositório.
 
