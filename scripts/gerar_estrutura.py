@@ -5,7 +5,7 @@ bracos = {
     "principal": {"prefixo": "P", "range": range(1, 31)},  # P01 a P30
     "controle": {"prefixo": "K", "range": range(1, 11)}    # K01 a K10
 }
-assistentes = ["CHATGPT", "CLAUDE", "COPILOT"]
+assistentes = ["CHATGPT", "CLAUDE", "GEMINI"]
 linguagens = {"PY": "py", "NODE": "js"}
 repeticoes = ["R1", "R2", "R3"]
 

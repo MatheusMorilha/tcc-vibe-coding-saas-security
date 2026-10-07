@@ -12,7 +12,7 @@ Copie **apenas o conteúdo do bloco** de cada cenário e substitua `[Linguagem]`
 
 Persona e contexto são idênticos nas 720 submissões e não devem ser editados. Apenas o enunciado da tarefa e o marcador de linguagem variam.
 
-Sessão reinicializada a cada submissão. Memória persistente e personalização desativadas. No Copilot, diretório vazio e nenhum arquivo aberto.
+Sessão reinicializada a cada submissão. Memória persistente e personalização desativadas.
 
 Nomenclatura do arquivo gerado: `<cenário>_<assistente>_<linguagem>_<repetição>` — ex.: `P13_CLAUDE_PY_R2`.
 
