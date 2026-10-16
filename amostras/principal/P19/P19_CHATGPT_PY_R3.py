@@ -200,7 +200,7 @@ def login(
     )
 
     # Não revelar se o e-mail existe.
-    if useris None:
+    if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Credenciais inválidas",
@@ -232,7 +232,7 @@ def login(
         )
     )
 
-    if tenantis None:
+    if tenant is None:
         # Estado inconsistente da base.
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

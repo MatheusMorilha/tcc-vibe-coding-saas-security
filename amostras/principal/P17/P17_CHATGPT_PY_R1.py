@@ -71,7 +71,7 @@ def approve_expense(
         .with_for_update()
     )
 
-    if expenseis None:
+    if expense is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Solicitação de despesa não encontrada.",

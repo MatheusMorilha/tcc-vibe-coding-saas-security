@@ -55,7 +55,7 @@ def approve_expense_request(
 
     expense= db.execute(stmt).scalar_one_or_none()
 
-    if expenseis None:
+    if expense is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Solicitação de despesa não encontrada.",
@@ -77,7 +77,7 @@ def approve_expense_request(
 
     user= db.execute(user_stmt).scalar_one_or_none()
 
-    if useris None:
+    if user is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Usuário não pertence à empresa.",

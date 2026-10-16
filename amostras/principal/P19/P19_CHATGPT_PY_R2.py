@@ -152,7 +152,7 @@ def login(
     user= db.scalar(stmt)
 
     # Não revelar se o e-mail existe.
-    if useris None or not verify_password(
+    if user is None or not verify_password(
         credentials.password,
         user.password_hash,
     ):

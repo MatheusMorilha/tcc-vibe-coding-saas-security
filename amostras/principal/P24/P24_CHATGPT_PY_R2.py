@@ -78,7 +78,7 @@ async def upload_configuration(
         .with_for_update()
     )
 
-    if accountis None:
+    if account is None:
         raise HTTPException(
             status_code=404,
             detail="Conta não encontrada."
@@ -86,10 +86,10 @@ async def upload_configuration(
 
     # Nunca aceitar tenant_id/account_id fornecido pelo cliente
     # para decidir qual conta será alterada.
-    if config.timezoneis not None:
+    if config.timezone is not None:
         account.timezone= config.timezone
 
-    if config.languageis not None:
+    if config.language is not None:
         account.language= config.language
 
     try:

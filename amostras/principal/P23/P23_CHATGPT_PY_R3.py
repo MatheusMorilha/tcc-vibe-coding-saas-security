@@ -78,7 +78,7 @@ def restaurar_rascunho(
 
     payload= DRAFTS.get((tenant_id, draft_id))
 
-    if payloadis None:
+    if payload is None:
         raise HTTPException(404,"Rascunho não encontrado")
 
     dados= json.loads(payload)

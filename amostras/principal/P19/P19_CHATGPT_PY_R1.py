@@ -142,7 +142,7 @@ def login(
     user= db.scalar(stmt)
 
     # Não revelar se o e-mail existe ou não.
-    if useris None:
+    if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Credenciais inválidas",

@@ -138,7 +138,7 @@ async def resend_contact_verification(
         tenant_id=authenticated_user.tenant_id,
     )
 
-    if useris None:
+    if user is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Usuário não encontrado.",

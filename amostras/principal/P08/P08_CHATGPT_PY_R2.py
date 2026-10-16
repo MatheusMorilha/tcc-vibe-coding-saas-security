@@ -87,7 +87,7 @@ def exportar_clientes(
         ]
     )
 
-    for clientein clientes:
+    for cliente in clientes:
         worksheet.append(
             [
                 cliente.id,

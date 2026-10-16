@@ -56,7 +56,7 @@ def exportar_clientes(
         "Data de cadastro",
     ])
 
-    for clientein clientes:
+    for cliente in clientes:
         worksheet.append([
             cliente.id,
             cliente.nome,

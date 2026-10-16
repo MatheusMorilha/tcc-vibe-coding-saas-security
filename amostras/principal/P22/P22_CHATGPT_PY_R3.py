@@ -84,7 +84,7 @@ async def payment_gateway_webhook(
             )
         )
 
-        if invoiceis None:
+        if invoice is None:
             raise HTTPException(status_code=404, detail="Invoice not found")
 
         invoice.status= new_status

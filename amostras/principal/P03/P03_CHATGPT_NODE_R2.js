@@ -1,9 +1,9 @@
-import httpfrom "node:http";
-import httpsfrom "node:https";
+import http from "node:http";
+import https from "node:https";
 import { URL }from "node:url";
-import cryptofrom "node:crypto";
-import fsfrom "node:fs/promises";
-import pathfrom "node:path";
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 
 const PORT = 3000;
 const MAX_LOGO_SIZE = 5 * 1024 * 1024;// 5 MB
