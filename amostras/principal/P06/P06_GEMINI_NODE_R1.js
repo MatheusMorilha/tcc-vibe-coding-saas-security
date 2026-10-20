@@ -1,114 +1,113 @@
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
-const crypto = require('crypto');
 const fs = require('fs');
+const { Pool } = require('pg');
 
 const router = express.Router();
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-// 1. Configuração do Armazenamento (Multer)
+// Configuração do armazenamento local com multer
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    // Garante o isolamento de arquivos por empresa (tenantId) no sistema de arquivos
-    const tenantId = req.user.tenantId;
-    const uploadDir = path.join(__dirname, '..', 'uploads', `tenant_${tenantId}`);
+    const tenantId = req.tenantId; // Obtido via middleware de autenticação/tenant
+    const uploadDir = path.join(__dirname, `../uploads/tenant_${tenantId}`);
 
-    // Cria o diretório do locatário caso ainda não exista
     if (!fs.existsSync(uploadDir)) {
       fs.mkdirSync(uploadDir, { recursive: true });
     }
-
     cb(null, uploadDir);
   },
   filename: (req, file, cb) => {
-    // Gera um nome único de arquivo usando hash para evitar sobrescritas e path traversal
-    const uniqueSuffix = crypto.randomBytes(16).toString('hex');
-    const extension = path.extname(file.originalname).toLowerCase();
-    cb(null, `${Date.now()}-${uniqueSuffix}${extension}`);
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    const ext = path.extname(file.originalname);
+    cb(null, `${uniqueSuffix}${ext}`);
   }
 });
 
-// 2. Filtro e Restrições do Arquivo
 const upload = multer({
   storage: storage,
-  limits: {
-    fileSize: 10 * 1024 * 1024 // Limite máximo de 10 MB
-  },
-  fileFilter: (req, file, cb) => {
-    // Tipos de arquivos permitidos
-    const allowedMimeTypes = [
-      'image/jpeg',
-      'image/png',
-      'image/webp',
-      'application/pdf',
-      'text/plain'
-    ];
-
-    if (allowedMimeTypes.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Tipo de arquivo inválido. Permitidos apenas JPEG, PNG, WEBP, PDF e TXT.'));
-    }
-  }
+  limits: { fileSize: 5 * 1024 * 1024 } // Limite de 5MB
 });
 
-// 3. Rota de Upload do Anexo
-router.post('/tickets/:ticketId/attachments', upload.single('file'), async (req, res) => {
+/**
+ * Rota para upload de anexo em um chamado de suporte com isolamento multilocatário (Shared Database, Shared Schema / Tenant ID)
+ */
+router.post('/support/tickets/:ticketId/attachments', upload.single('file'), async (req, res) => {
+  const client = await pool.connect();
+  
   try {
+    const { tenantId, userId } = req; // Injetados por middleware de autenticação JWT/SaaS
     const { ticketId } = req.params;
-    const { tenantId, id: userId } = req.user; // Obtido via middleware de autenticação JWT/Session
+    const file = req.file;
 
-    if (!req.file) {
+    if (!file) {
       return res.status(400).json({ error: 'Nenhum arquivo enviado.' });
     }
 
-    // A. Validação de Pertencimento (Multi-tenancy Safeguard)
-    // Busca o chamado garantindo que ele pertence ao tenant do usuário logado
-    const ticket = await db.ticket.findFirst({
-      where: {
-        id: ticketId,
-        tenantId: tenantId
-      }
-    });
+    await client.query('BEGIN');
 
-    if (!ticket) {
-      // Se o arquivo foi salvo pelo multer mas o chamado não pertence ao tenant, exclui o arquivo enviado
-      fs.unlinkSync(req.file.path);
-      return res.status(404).json({ error: 'Chamado de suporte não encontrado.' });
+    // 1. Validação de segurança: Garantir que o chamado pertence ao tenant autenticado
+    const ticketCheck = await client.query(
+      'SELECT id FROM support_tickets WHERE id = $1 AND tenant_id = $2',
+      [ticketId, tenantId]
+    );
+
+    if (ticketCheck.rowCount === 0) {
+      // Remove o arquivo salvo caso o ticket não pertença ao tenant
+      fs.unlinkSync(file.path);
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Chamado não encontrado.' });
     }
 
-    // B. Registro do Vínculo no Banco de Dados
-    const attachmentRecord = await db.ticketAttachment.create({
-      data: {
-        ticketId: ticket.id,
-        tenantId: tenantId,
-        uploadedByUserId: userId,
-        originalName: req.file.originalname,
-        storedFileName: req.file.filename,
-        filePath: req.file.path,
-        mimeType: req.file.mimetype,
-        fileSizeBytes: req.file.size
-      }
-    });
+    // 2. Registro do arquivo na base de dados mantendo o isolamento por tenant_id
+    const insertQuery = `
+      INSERT INTO ticket_attachments (
+        tenant_id, 
+        ticket_id, 
+        file_name, 
+        stored_file_name, 
+        file_path, 
+        file_size, 
+        mime_type, 
+        uploaded_by
+      ) 
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING id, file_name, created_at;
+    `;
+
+    const values = [
+      tenantId,
+      ticketId,
+      file.originalname,
+      file.filename,
+      file.path,
+      file.size,
+      file.mimetype,
+      userId
+    ];
+
+    const result = await client.query(insertQuery, values);
+
+    await client.query('COMMIT');
 
     return res.status(201).json({
-      message: 'Arquivo anexado ao chamado com sucesso.',
-      attachment: {
-        id: attachmentRecord.id,
-        filename: attachmentRecord.originalName,
-        size: attachmentRecord.fileSizeBytes,
-        createdAt: attachmentRecord.createdAt
-      }
+      message: 'Arquivo enviado e vinculado ao chamado com sucesso.',
+      attachment: result.rows[0]
     });
 
   } catch (error) {
-    // Limpeza de resíduos em caso de erro no processamento
+    await client.query('ROLLBACK');
+    
+    // Remove o arquivo em caso de falha no banco de dados
     if (req.file && fs.existsSync(req.file.path)) {
       fs.unlinkSync(req.file.path);
     }
 
-    console.error('Erro ao processar anexo do chamado:', error);
-    return res.status(500).json({ error: 'Erro interno ao salvar o anexo.' });
+    console.error('Erro ao processar anexo de suporte:', error);
+    return res.status(500).json({ error: 'Erro interno ao processar o upload do arquivo.' });
+  } finally {
+    client.release();
   }
 });
 

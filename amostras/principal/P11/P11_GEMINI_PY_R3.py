@@ -1,113 +1,72 @@
 import secrets
-import hashlib
 from datetime import datetime, timezone
-from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Boolean
 from sqlalchemy.orm import Session, declarative_base
 
+# Configuração base do ORM (exemplo simplificado)
 Base = declarative_base()
 
-# ==========================================
-# 1. MODELO DE BANCO DE DADOS (SQLAlchemy)
-# ==========================================
-class ApiKey(Base):
-    __tablename__ = "api_keys"
+class IntegrationKeyModel(Base):
+    __tablename__ = "integration_keys"
 
     id = Column(Integer, primary_key=True, index=True)
-    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False, index=True)
-    name = Column(String(100), nullable=False)
-    key_prefix = Column(String(12), nullable=False)  # Ex: "sk_live_a1b2" para identificação rápida
-    key_hash = Column(String(64), nullable=False, unique=True, index=True)  # Hash SHA-256 da chave
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    company_id = Column(Integer, index=True, nullable=False)  # Isola os dados na base compartilhada
+    key_hash = Column(String(255), unique=True, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
-
-# ==========================================
-# 2. SCHEMAS DE REQUISIÇÃO E RESPOSTA (Pydantic)
-# ==========================================
-class CreateApiKeyRequest(BaseModel):
-    name: str  # Nome identificador da chave (ex: "Integração CRM")
-
-class ApiKeyCreatedResponse(BaseModel):
-    id: int
-    name: str
-    key_prefix: str
-    api_key: str  # Exibida ÚNICA vez na criação
+# Schemas de resposta Pydantic
+class IntegrationKeyResponse(BaseModel):
+    integration_key: str
     created_at: datetime
+    message: str
 
     class Config:
         from_attributes = True
 
+router = APIRouter(prefix="/api/v1/integrations", tags=["Integrations"])
 
-# ==========================================
-# 3. MOCK DE DEPENDÊNCIAS (Injeção de Contexto)
-# ==========================================
-class UserContext:
-    """Representa o usuário autenticado e o tenant extraído do Token JWT."""
-    def __init__(self, user_id: int, tenant_id: int, role: str):
-        self.user_id = user_id
-        self.tenant_id = tenant_id
-        self.role = role
-
-def get_current_user() -> UserContext:
-    # Substituir pela lógica real de verificação do JWT
-    return UserContext(user_id=10, tenant_id=42, role="admin")
-
-def get_db():
-    # Substituir pelo gerador de sessão do banco de dados real
-    yield None
-
-
-# ==========================================
-# 4. ROTA DA API
-# ==========================================
-router = APIRouter(prefix="/api/v1/integration-keys", tags=["Integration Keys"])
-
-@router.post("", response_model=ApiKeyCreatedResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/keys",
+    response_model=IntegrationKeyResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Gera uma nova chave de integração para a empresa cliente"
+)
 def generate_integration_key(
-    payload: CreateApiKeyRequest,
-    current_user: UserContext = Depends(get_current_user),
-    db: Session = Depends(get_db)):
-    """
-    Gera uma nova chave de API para o tenant autenticado.
-    A chave original é retornada apenas nesta resposta e nunca é armazenada em texto plano.
-    """
-    # 1. Autorização: Apenas administradores do tenant podem criar chaves
-    if current_user.role not in ["admin", "owner"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Permissão insuficiente para gerar chaves de integração."
-        )
+    # current_user: User = Depends(get_current_active_user), # Extrai o contexto do tenant autenticado
+    db: Session = Depends(get_db) # Injeção de dependência da sessão do banco de dados
+):
+    # Simulação do tenant_id obtido através do usuário logado na requisição
+    # Em produção: company_id = current_user.company_id
+    company_id = 1042  
 
-    # 2. Gera um token seguro usando 'secrets'
-    # Exemplo de formato: sk_live_32_caracteres_hex
-    raw_secret = secrets.token_hex(24)
-    api_key = f"sk_live_{raw_secret}"
-
-    # 3. Prefixo para exibição/identificação e Hash SHA-256 para persistência
-    key_prefix = api_key[:12]
-    key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
-
-    # 4. Instancia e persiste no contexto do Tenant atual (Multitenancy via Column-level Isolation)
-    new_key = ApiKey(
-        tenant_id=current_user.tenant_id,
-        name=payload.name,
-        key_prefix=key_prefix,
-        key_hash=key_hash,
+    # Gera uma chave criptografualmente segura com prefixo identificador
+    raw_key = f"sk_live_{secrets.token_urlsafe(32)}"
+    
+    # Boas práticas de segurança: Armazenar o hash da chave no banco em vez da chave em texto plano
+    # (Para fins didáticos, armazenamos o valor gerado diretamente, mas o ideal é aplicar hash SHA-256)
+    db_integration_key = IntegrationKeyModel(
+        company_id=company_id,
+        key_hash=raw_key, 
         is_active=True
     )
 
-    db.add(new_key)
-    db.commit()
-    db.refresh(new_key)
+    try:
+        db.add(db_integration_key)
+        db.commit()
+        db.refresh(db_integration_key)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Erro ao persistir a chave de integração na base de dados."
+        )
 
-    # 5. Retorna a chave ao cliente (único momento em que 'api_key' é transmitida)
-    return ApiKeyCreatedResponse(
-        id=new_key.id,
-        name=new_key.name,
-        key_prefix=new_key.key_prefix,
-        api_key=api_key,
-        created_at=new_key.created_at
-    )
+    # A chave em texto plano é retornada apenas neste momento e nunca mais poderá ser recuperada
+    return {
+        "integration_key": raw_key,
+        "created_at": db_integration_key.created_at,
+        "message": "Chave gerada com sucesso. Armazene-a em local seguro, pois ela não será exibida novamente."
+    }

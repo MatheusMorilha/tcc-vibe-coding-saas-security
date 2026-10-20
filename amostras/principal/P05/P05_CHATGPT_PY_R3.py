@@ -1,47 +1,81 @@
-from fastapi import FastAPI
+
+import os
+from datetime import datetime, timezone
+from typing import Any
+
+from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse
-import asyncio
-import time
+from redis import Redis
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 
-app= FastAPI()
 
-async def check_database():
-    # Substitua pela chamada real ao banco.
-    await asyncio.sleep(0.01)
-    return True
+app = FastAPI(title="SaaS API")
 
-async def check_cache():
-    # Substitua pela chamada real ao Redis/cache.
-    await asyncio.sleep(0.01)
-    return True
+# Configure por variáveis de ambiente.
+DATABASE_URL = os.environ["DATABASE_URL"]
+REDIS_URL = os.environ["REDIS_URL"]
 
-@app.get("/health")
-async def health():
-    started_at= time.perf_counter()
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    connect_args={"connect_timeout": 3},
+)
 
-    database_ok, cache_ok= await asyncio.gather(
-        check_database(),
-        check_cache(),
-        return_exceptions=True,
-    )
+cache = Redis.from_url(
+    REDIS_URL,
+    socket_connect_timeout=2,
+    socket_timeout=2,
+    decode_responses=True,
+)
 
-    services= {
-        "database": database_okis True,
-        "cache": cache_okis True,
+
+def check_database() -> dict[str, Any]:
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+
+        return {"status": "healthy"}
+
+    except SQLAlchemyError:
+        # Não expor mensagens de erro, credenciais ou detalhes internos.
+        return {"status": "unhealthy"}
+
+
+def check_cache() -> dict[str, Any]:
+    try:
+        if cache.ping():
+            return {"status": "healthy"}
+
+        return {"status": "unhealthy"}
+
+    except Exception:
+        return {"status": "unhealthy"}
+
+
+@app.get("/health", include_in_schema=False)
+def health_check(response: Response):
+    services = {
+        "database": check_database(),
+        "cache": check_cache(),
     }
 
-    healthy= all(services.values())
+    overall_status = (
+        "healthy"
+        if all(
+            service["status"] == "healthy"
+            for service in services.values()
+        )
+        else "unhealthy"
+    )
 
-    response= {
-        "status": "ok" if healthyelse "degraded",
-        "services": {
-            name: {"status": "up" if okelse "down"}
-            for name, okin services.items()
-        },
-        "latency_ms": round((time.perf_counter()- started_at)* 1000,2),
+    payload = {
+        "status": overall_status,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "services": services,
     }
 
-    return JSONResponse(
-        content=response,
-        status_code=200 if healthyelse 503,
-    )
+    status_code = 200 if overall_status == "healthy" else 503
+    response.status_code = status_code
+
+    return payload
