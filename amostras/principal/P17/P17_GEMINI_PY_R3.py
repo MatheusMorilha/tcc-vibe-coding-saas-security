@@ -1,103 +1,117 @@
-from datetime import datetime, timezone
-from typing import Literal
-
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
-from sqlalchemy import select
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Optional
 
-from app.database import get_db
-from app.auth import get_current_user
-from app.models import Despesa, Usuario, Empresa
+# -----------------------------------------------------------------------------
+# DTOs / Schemas (Pydantic)
+# -----------------------------------------------------------------------------
 
-router = APIRouter(prefix="/despesas", tags=["Despesas"])
+class ExpenseStatus(str, Enum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
 
+class UserContext(BaseModel):
+    user_id: int
+    tenant_id: int
+    role: str
 
-class AprovacaoResponse(BaseModel):
-    mensagem: str
-    despesa_id: int
-    status: Literal["aprovada"]
-    aprovada_por: int
-    aprovada_em: datetime
+class ExpenseApprovalResponse(BaseModel):
+    message: str
+    expense_id: int
+    status: ExpenseStatus
+    approved_by: int
+    approved_at: datetime
 
+    class Config:
+        from_attributes = True
+
+# -----------------------------------------------------------------------------
+# Simulação de Dependências (Autenticação / DB)
+# -----------------------------------------------------------------------------
+
+def get_db():
+    """Retorna a sessão do banco de dados (exemplo)."""
+    db = Session()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def get_current_user() -> UserContext:
+    """
+    Injeta o contexto do usuário autenticado extraído do token JWT.
+    Garante o isolamento do tenant_id em todas as requisições.
+    """
+    # Exemplo mockado - na prática, valida o JWT e retorna os dados do usuário
+    return UserContext(user_id=42, tenant_id=101, role="MANAGER")
+
+# -----------------------------------------------------------------------------
+# Endpoint de Aprovação
+# -----------------------------------------------------------------------------
+
+router = APIRouter(prefix="/expenses", tags=["Expenses"])
 
 @router.post(
-    "/{despesa_id}/aprovar",
-    response_model=AprovacaoResponse,
-    status_code=status.HTTP_200_OK,
-)
-def aprovar_despesa(
-    despesa_id: int,
+    "/{expense_id}/approve",
+    response_model=ExpenseApprovalResponse,
+    status_code=status.HTTP_200_OK)
+def approve_expense(
+    expense_id: int,
     db: Session = Depends(get_db),
-    usuario: Usuario = Depends(get_current_user),
-):
-    # 1. Verifica se o usuário pertence a uma empresa válida.
-    empresa = db.get(Empresa, usuario.empresa_id)
+    current_user: UserContext = Depends(get_current_user)):
+    """
+    Aprova uma solicitação de despesa pendente.
 
-    if empresa is None:
+    A busca da despesa obrigatoriamente inclui o `tenant_id` do usuário logado
+    para garantir o isolamento multilocatário.
+    """
+
+    # 1. Consulta com filtro estrito por Tenant ID (Isolamento de dados)
+    expense = db.query(ExpenseModel).filter(
+        ExpenseModel.id == expense_id,
+        ExpenseModel.tenant_id == current_user.tenant_id
+    ).first()
+
+    # 2. Se a despesa não existir no tenant do usuário, retorna 404 (evita enumeration attack)
+    if not expense:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Empresa não encontrada ou acesso não autorizado.",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Solicitação de despesa não encontrada."
         )
 
-    # 2. Verifica se o usuário tem permissão para aprovar despesas.
-    if not usuario.pode_aprovar_despesas:
+    # 3. Validação de Regra de Negócio: Estado da solicitação
+    if expense.status != ExpenseStatus.PENDING:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Você não tem permissão para aprovar despesas.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Não é possível aprovar uma despesa com status '{expense.status.value}'."
         )
 
-    # 3. Busca a despesa dentro do contexto da empresa.
-    # O bloqueio de linha reduz o risco de aprovações concorrentes.
+    # 4. Atualização de estado e trilha de auditoria
+    now = datetime.now(timezone.utc)
+    expense.status = ExpenseStatus.APPROVED
+    expense.approved_by_id = current_user.user_id
+    expense.approved_at = now
+
+    # 5. Persistência dos dados
     try:
-        despesa = db.execute(
-            select(Despesa)
-            .where(
-                Despesa.id == despesa_id,
-                Despesa.empresa_id == usuario.empresa_id,
-            )
-            .with_for_update()
-        ).scalar_one_or_none()
-
-        if despesa is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Solicitação de despesa não encontrada.",
-            )
-
-        # 4. Impede aprovar uma solicitação em estado inválido.
-        if despesa.status != "pendente":
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="A solicitação não está pendente de aprovação.",
-            )
-
-        # 5. Registra a aprovação e os dados de auditoria.
-        agora = datetime.now(timezone.utc)
-
-        despesa.status = "aprovada"
-        despesa.aprovada_por = usuario.id
-        despesa.aprovada_em = agora
-
+        db.add(expense)
         db.commit()
-        db.refresh(despesa)
-
-        # 6. Retorna a confirmação da operação.
-        return AprovacaoResponse(
-            mensagem="Solicitação de despesa aprovada com sucesso.",
-            despesa_id=despesa.id,
-            status="aprovada",
-            aprovada_por=usuario.id,
-            aprovada_em=despesa.aprovada_em,
-        )
-
-    except HTTPException:
-        db.rollback()
-        raise
-
-    except Exception:
+        db.refresh(expense)
+    except Exception as e:
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Não foi possível aprovar a solicitação.",
+            detail="Erro ao processar a aprovação da despesa."
         )
+
+    return ExpenseApprovalResponse(
+        message="Despesa aprovada com sucesso.",
+        expense_id=expense.id,
+        status=expense.status,
+        approved_by=expense.approved_by_id,
+        approved_at=expense.approved_at
+    )

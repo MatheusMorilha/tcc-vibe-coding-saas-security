@@ -1,272 +1,143 @@
-from datetime import date, datetime, time, timedelta, timezone
-from typing import Generator
+from datetime import datetime
+from enum import Enum
+from typing import List, Optional
 from uuid import UUID
 
-from fastapi import (
-    APIRouter,
-    Depends,
-    HTTPException,
-    Query,
-)
-from pydantic import BaseModel, ConfigDict
-from sqlalchemy import (
-    DateTime,
-    ForeignKey,
-    String,
-    Text,
-    Uuid,
-    create_engine,
-    func,
-    select,
-)
-from sqlalchemy.orm import (
-    DeclarativeBase,
-    Mapped,
-    Session,
-    mapped_column,
-    sessionmaker,
-)
-from sqlalchemy.dialects.postgresql import TSVECTOR
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
+from sqlalchemy import or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+# Imports hipotéticos da estrutura da sua aplicação
+from app.database import get_db_session
+from app.models.document import DocumentModel
+from app.security import UserContext, get_current_user
+
+router = APIRouter(prefix="/api/v1/documents", tags=["Documentos"])
 
 
-# --------------------------------------------------
-# Configuração do banco de dados
-# --------------------------------------------------
+# --- Schemas de Entrada e Saída ---
 
-DATABASE_URL = "postgresql+psycopg://user:password@localhost/saas"
-
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(
-    bind=engine,
-    autoflush=False,
-    expire_on_commit=False,
-)
+class DocumentTypeEnum(str, Enum):
+    CONTRACT = "contract"
+    INVOICE = "invoice"
+    REPORT = "report"
+    OTHER = "other"
 
 
-class Base(DeclarativeBase):
-    pass
-
-
-def get_db() -> Generator[Session, None, None]:
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-# --------------------------------------------------
-# Modelos
-# --------------------------------------------------
-
-class Document(Base):
-    __tablename__ = "documents"
-
-    id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), primary_key=True
+class DocumentSearchFilter(BaseModel):
+    query: Optional[str] = Field(
+        None,
+        min_length=2,
+        description="Termo para busca textual no título ou conteúdo"
     )
-    tenant_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), index=True, nullable=False
+    doc_type: Optional[DocumentTypeEnum] = Field(
+        None,
+        description="Filtro por tipo de documento"
     )
-    author_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), nullable=False
+    author_id: Optional[UUID] = Field(
+        None,
+        description="Filtro por autor do documento"
     )
-    title: Mapped[str] = mapped_column(String(255), nullable=False)
-    content: Mapped[str] = mapped_column(Text, nullable=False)
-    document_type: Mapped[str] = mapped_column(
-        String(50), nullable=False
+    date_from: Optional[datetime] = Field(
+        None,
+        description="Data/hora inicial da criação"
     )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
+    date_to: Optional[datetime] = Field(
+        None,
+        description="Data/hora final da criação"
     )
 
 
-# --------------------------------------------------
-# Identidade autenticada
-# --------------------------------------------------
-
-class CurrentUser(BaseModel):
-    id: UUID
-    tenant_id: UUID
-
-
-def get_current_user() -> CurrentUser:
-    """
-    Substitua pela dependência real de autenticação:
-    validação do token, identificação do usuário e
-    resolução do tenant no servidor.
-
-    Nunca obtenha tenant_id de um parâmetro controlado
-    livremente pelo cliente.
-    """
-    raise HTTPException(
-        status_code=401,
-        detail="Autenticação necessária",
-    )
-
-
-def require_active_subscription(
-    user: CurrentUser = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> CurrentUser:
-    """
-    Integre aqui a verificação da assinatura ativa
-    do tenant, consultando a tabela de assinaturas.
-    """
-    # Exemplo: consultar a assinatura vinculada a user.tenant_id.
-    # Se não estiver ativa, lançar HTTPException(403, ...).
-    return user
-
-
-# --------------------------------------------------
-# Resposta da API
-# --------------------------------------------------
-
-class DocumentResult(BaseModel):
+class DocumentResponse(BaseModel):
     id: UUID
     title: str
-    document_type: str
+    content_summary: str
+    doc_type: DocumentTypeEnum
     author_id: UUID
     created_at: datetime
-    relevance: float
 
-    model_config = ConfigDict(from_attributes=True)
+    class Config:
+        from_attributes = True
 
 
-class DocumentSearchResponse(BaseModel):
-    items: list[DocumentResult]
+class PaginatedDocumentResponse(BaseModel):
+    items: List[DocumentResponse]
     page: int
     page_size: int
-    total: int
+    total_items: int
 
 
-# --------------------------------------------------
-# Rota de busca textual
-# --------------------------------------------------
+# --- Endpoint de Busca ---
 
-router = APIRouter(prefix="/documents", tags=["Documents"])
+@router.get("/search", response_model=PaginatedDocumentResponse)
+async def search_documents(
+    search_params: DocumentSearchFilter = Depends(),
+    page: int = Query(1, ge=1, description="Número da página"),
+    page_size: int = Query(20, ge=1, le=100, description="Itens por página"),
+    current_user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session)):
+    """
+    Realiza busca textual com múltiplos filtros opcionais combináveis em documentos.
+    Garante o isolamento do tenant filtrando estritamente pelo tenant_id do usuário autenticado.
+    """
 
-
-@router.get("/search", response_model=DocumentSearchResponse)
-def search_documents(
-    q: str = Query(..., min_length=2, max_length=200),
-    document_type: str | None = Query(
-        default=None, alias="type", max_length=50
-    ),
-    author_id: UUID | None = Query(default=None),
-    start_date: date | None = Query(default=None),
-    end_date: date | None = Query(default=None),
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
-    user: CurrentUser = Depends(require_active_subscription),
-    db: Session = Depends(get_db),
-) -> DocumentSearchResponse:
-
-    # Validações dos filtros
-    if start_date and end_date and start_date > end_date:
-        raise HTTPException(
-            status_code=422,
-            detail="start_date não pode ser posterior a end_date",
-        )
-
-    term = q.strip()
-    if len(term) < 2:
-        raise HTTPException(
-            status_code=422,
-            detail="O termo de busca deve conter pelo menos 2 caracteres",
-        )
-
-    # Busca textual nativa do PostgreSQL em português.
-    searchable_text = func.to_tsvector(
-        "portuguese",
-        func.concat(
-            Document.title,
-            " ",
-            Document.content,
-        ),
+    # 1. Regra de Ouro Multi-tenant: Sempre filtrar por tenant_id do contexto autenticado
+    stmt = select(DocumentModel).where(
+        DocumentModel.tenant_id == current_user.tenant_id,
+        DocumentModel.is_deleted == False
     )
 
-    search_query = func.plainto_tsquery("portuguese", term)
-
-    relevance = func.ts_rank(
-        searchable_text,
-        search_query,
-    ).label("relevance")
-
-    # REGRA CRÍTICA: o tenant é sempre aplicado.
-    # O cliente não pode remover nem substituir esse filtro.
-    conditions = [
-        Document.tenant_id == user.tenant_id,
-        searchable_text.op("@@")(search_query),
-    ]
-
-    # Os filtros opcionais são combinados com AND.
-    if document_type:
-        conditions.append(
-            Document.document_type == document_type
+    # 2. Aplicação dinâmica dos filtros opcionais
+    if search_params.query:
+        # Busca textual simples utilizando ILIKE (case-insensitive)
+        # Para volumes massivos, recomenda-se PostgreSQL Full-Text Search (to_tsquery)
+        search_term = f"%{search_params.query}%"
+        stmt = stmt.where(
+            or_(
+                DocumentModel.title.ilike(search_term),
+                DocumentModel.content.ilike(search_term)
+            )
         )
 
-    if author_id:
-        conditions.append(Document.author_id == author_id)
+    if search_params.doc_type:
+        stmt = stmt.where(DocumentModel.doc_type == search_params.doc_type)
 
-    if start_date:
-        start_datetime = datetime.combine(
-            start_date, time.min, tzinfo=timezone.utc
-        )
-        conditions.append(
-            Document.created_at >= start_datetime
-        )
+    if search_params.author_id:
+        stmt = stmt.where(DocumentModel.author_id == search_params.author_id)
 
-    if end_date:
-        # Limite exclusivo: inclui todo o dia final.
-        end_datetime = datetime.combine(
-            end_date + timedelta(days=1),
-            time.min,
-            tzinfo=timezone.utc,
-        )
-        conditions.append(
-            Document.created_at < end_datetime
-        )
+    if search_params.date_from:
+        stmt = stmt.where(DocumentModel.created_at >= search_params.date_from)
 
-    # Total de resultados antes da paginação.
-    count_stmt = (
-        select(func.count())
-        .select_from(Document)
-        .where(*conditions)
-    )
-    total = db.scalar(count_stmt) or 0
+    if search_params.date_to:
+        stmt = stmt.where(DocumentModel.created_at <= search_params.date_to)
 
-    # Resultados ordenados por relevância e data.
+    # Validation: date_from deve ser anterior a date_to
+    if search_params.date_from and search_params.date_to:
+        if search_params.date_from > search_params.date_to:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="A data inicial (date_from) não pode ser posterior à data final (date_to)."
+            )
+
+    # 3. Paginação e Ordenação
+    stmt = stmt.order_by(DocumentModel.created_at.desc())
+
+    # Contagem básica para metadados (Query simplificada)
+    total_result = await db.execute(stmt)
+    total_items = len(total_result.scalars().all())
+
+    # Aplicação do OFFSET e LIMIT
     offset = (page - 1) * page_size
+    stmt = stmt.offset(offset).limit(page_size)
 
-    stmt = (
-        select(Document, relevance)
-        .where(*conditions)
-        .order_by(
-            relevance.desc(),
-            Document.created_at.desc(),
-        )
-        .offset(offset)
-        .limit(page_size)
-    )
+    # Execução final da query
+    result = await db.execute(stmt)
+    documents = result.scalars().all()
 
-    rows = db.execute(stmt).all()
-
-    items = [
-        DocumentResult(
-            id=document.id,
-            title=document.title,
-            document_type=document.document_type,
-            author_id=document.author_id,
-            created_at=document.created_at,
-            relevance=float(score or 0),
-        )
-        for document, score in rows
-    ]
-
-    return DocumentSearchResponse(
-        items=items,
+    return PaginatedDocumentResponse(
+        items=documents,
         page=page,
         page_size=page_size,
-        total=total,
+        total_items=total_items
     )
