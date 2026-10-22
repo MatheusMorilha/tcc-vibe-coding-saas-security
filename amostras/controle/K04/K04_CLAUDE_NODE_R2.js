@@ -1,208 +1,186 @@
 'use strict';
 
-/**
- * POST /api/usuarios
- * Dependências: express helmet express-rate-limit zod argon2 pg
- *
- * Contrato do middleware de autenticação (não incluído aqui):
- *   `authenticate` valida o JWT/sessão e define req.auth = { userId, tenantId, papel }
- *   `exigirPapel('admin')` bloqueia quem não for administrador do tenant.
- *
- * Esquema mínimo esperado (PostgreSQL):
- *   CREATE TABLE usuarios (
- *     id         UUID PRIMARY KEY,
- *     tenant_id  UUID NOT NULL REFERENCES tenants(id),
- *     nome       VARCHAR(120) NOT NULL,
- *     email      VARCHAR(254) NOT NULL,
- *     senha_hash TEXT NOT NULL,
- *     papel      VARCHAR(20) NOT NULL DEFAULT 'membro',
- *     ativo      BOOLEAN NOT NULL DEFAULT TRUE,
- *     criado_em  TIMESTAMPTZ NOT NULL DEFAULT now()
- *   );
- *   -- unicidade de e-mail POR empresa, garantida pelo banco (evita race condition)
- *   CREATE UNIQUE INDEX usuarios_tenant_email_uq ON usuarios (tenant_id, lower(email));
- */
-
-const crypto = require('node:crypto');
 const express = require('express');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { z } = require('zod');
 const argon2 = require('argon2');
+const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
-const { authenticate, exigirPapel } = require('./middlewares/auth');
+const pino = require('pino');
 
-// ---------------------------------------------------------------------------
-// Banco de dados (A02/A05: TLS e credenciais via variável de ambiente)
-// ---------------------------------------------------------------------------
+const log = pino({ redact: ['req.headers.authorization', '*.password', '*.password_hash'] });
+
+// ---------- Configuração (A05: sem segredos hardcoded, falha se ausentes) ----------
+const { DATABASE_URL, JWT_PUBLIC_KEY, JWT_ISSUER, JWT_AUDIENCE } = process.env;
+if (!DATABASE_URL || !JWT_PUBLIC_KEY || !JWT_ISSUER || !JWT_AUDIENCE) {
+  throw new Error('Variáveis de ambiente obrigatórias ausentes.');
+}
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : false,
-  max: 20,
-  statement_timeout: 5000,
 });
 
-// ---------------------------------------------------------------------------
-// Validação de entrada (A03/A04): allowlist de campos, tipos e tamanhos.
-// .strict() rejeita campos extras => impede mass assignment
-// (ex.: o cliente enviar "papel", "tenant_id" ou "ativo").
-// ---------------------------------------------------------------------------
-const criarUsuarioSchema = z
-  .object({
-    nome: z.string().trim().min(2).max(120),
-    email: z.string().trim().toLowerCase().email().max(254),
-    // Limite superior evita DoS no hashing; 12+ caracteres conforme NIST 800-63B
-    senha: z.string().min(12).max(128),
-  })
-  .strict();
-
-// A04/A07: rate limit contra criação em massa e abuso
-const limitador = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 30,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { erro: 'Muitas requisições. Tente novamente mais tarde.' },
-});
-
-// A02: Argon2id (parâmetros mínimos recomendados pela OWASP)
+// Parâmetros recomendados pela OWASP para Argon2id
 const ARGON2_OPTS = {
   type: argon2.argon2id,
-  memoryCost: 19456, // ~19 MiB
+  memoryCost: 19456, // 19 MiB
   timeCost: 2,
   parallelism: 1,
 };
 
-// ---------------------------------------------------------------------------
-// Rota
-// ---------------------------------------------------------------------------
-const router = express.Router();
+// ---------- Validação (A03/A04) ----------
+const createUserSchema = z
+  .object({
+    name: z.string().trim().min(2).max(120),
+    email: z.string().trim().toLowerCase().email().max(254),
+    // NIST 800-63B: tamanho mínimo e máximo, sem regras de composição arbitrárias
+    password: z.string().min(12).max(128),
+  })
+  .strict(); // rejeita campos extras (tenant_id, role, etc.)
 
-router.post(
-  '/',
-  limitador,
-  authenticate, // A01/A07: exige identidade verificada
-  exigirPapel('admin'), // A01: controle de acesso por função
+// ---------- Autenticação e autorização (A01/A07) ----------
+function authenticate(req, res, next) {
+  const header = req.get('authorization') || '';
+  const [scheme, token] = header.split(' ');
+  if (scheme !== 'Bearer' || !token) {
+    return res.status(401).json({ error: 'Não autenticado.' });
+  }
+  try {
+    const claims = jwt.verify(token, JWT_PUBLIC_KEY, {
+      algorithms: ['RS256'], // fixa o algoritmo, evitando "alg: none" e confusão HS/RS
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    });
+    if (!claims.sub || !claims.tenant_id || !claims.role) throw new Error('claims');
+    req.auth = { userId: claims.sub, tenantId: claims.tenant_id, role: claims.role };
+    next();
+  } catch {
+    return res.status(401).json({ error: 'Não autenticado.' });
+  }
+}
+
+function requireRole(...roles) {
+  return (req, res, next) =>
+    roles.includes(req.auth.role)
+      ? next()
+      : res.status(403).json({ error: 'Acesso negado.' });
+}
+
+// ---------- App ----------
+const app = express();
+app.disable('x-powered-by');
+app.use(helmet());
+app.use(express.json({ limit: '10kb' })); // limita tamanho do body
+
+// Rate limit específico (A07): protege contra abuso e enumeração
+const createUserLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.post(
+  '/api/v1/users',
+  createUserLimiter,
+  authenticate,
+  requireRole('admin'),
   async (req, res, next) => {
-    // 1) Validação
-    const parsed = criarUsuarioSchema.safeParse(req.body);
+    // 1. Validação de entrada
+    const parsed = createUserSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({
-        erro: 'Dados inválidos.',
-        // Não ecoa os valores recebidos, só campo e regra violada
-        detalhes: parsed.error.issues.map((i) => ({
-          campo: i.path.join('.'),
-          mensagem: i.message,
-        })),
+        error: 'Dados inválidos.',
+        details: parsed.error.issues.map((i) => ({ field: i.path.join('.'), message: i.message })),
       });
     }
+    const { name, email, password } = parsed.data;
+    const tenantId = req.auth.tenantId; // sempre do token, nunca do body
 
-    const { nome, email, senha } = parsed.data;
-
-    // A01 (isolamento multilocatário): tenant SEMPRE vem da sessão autenticada
-    const { tenantId, userId: atorId } = req.auth;
-
-    // 2) Hash fora da transação, para não segurar lock durante o cálculo
-    let senhaHash;
+    let client;
     try {
-      senhaHash = await argon2.hash(senha, ARGON2_OPTS);
-    } catch (err) {
-      return next(err);
-    }
+      // 2. Hash fora da transação para não segurar conexão/lock durante operação cara
+      const passwordHash = await argon2.hash(password, ARGON2_OPTS);
 
-    const client = await pool.connect();
-    try {
+      client = await pool.connect();
       await client.query('BEGIN');
 
-      // 3) Regra de negócio: assinatura ativa e limite de usuários do plano.
-      //    FOR UPDATE no tenant serializa cadastros concorrentes e impede
-      //    estourar o limite do plano (race condition).
-      const { rows: plano } = await client.query(
-        `SELECT p.max_usuarios,
-                (SELECT COUNT(*) FROM usuarios u
-                  WHERE u.tenant_id = $1 AND u.ativo) AS total
-           FROM tenants t
-           JOIN planos p ON p.id = t.plano_id
-          WHERE t.id = $1 AND t.assinatura_ativa = TRUE
-            FOR UPDATE OF t`,
+      // 3. Lock na linha do tenant: serializa cadastros concorrentes e valida o plano
+      const { rows: tenantRows } = await client.query(
+        'SELECT max_users, plan_active FROM tenants WHERE id = $1 FOR UPDATE',
         [tenantId]
       );
-
-      if (plano.length === 0) {
+      const tenant = tenantRows[0];
+      if (!tenant || !tenant.plan_active) {
         await client.query('ROLLBACK');
-        return res.status(403).json({ erro: 'Assinatura inativa ou inexistente.' });
-      }
-      if (Number(plano[0].total) >= plano[0].max_usuarios) {
-        await client.query('ROLLBACK');
-        return res.status(403).json({ erro: 'Limite de usuários do plano atingido.' });
+        return res.status(403).json({ error: 'Assinatura inativa.' });
       }
 
-      // 4) Persistência (A03: query parametrizada, sem concatenação de string).
-      //    O papel é fixo no servidor, nunca vem do cliente.
-      const { rows } = await client.query(
-        `INSERT INTO usuarios (id, tenant_id, nome, email, senha_hash, papel)
-         VALUES ($1, $2, $3, $4, $5, 'membro')
-         RETURNING id, nome, email, papel, criado_em`,
-        [crypto.randomUUID(), tenantId, nome, email, senhaHash]
+      const { rows: countRows } = await client.query(
+        'SELECT COUNT(*)::int AS total FROM users WHERE tenant_id = $1',
+        [tenantId]
       );
+      if (countRows[0].total >= tenant.max_users) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ error: 'Limite de usuários do plano atingido.' });
+      }
+
+      // 4. Inserção parametrizada; unicidade garantida pelo índice (sem race condition)
+      const { rows } = await client.query(
+        `INSERT INTO users (tenant_id, name, email, password_hash)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (tenant_id, email) DO NOTHING
+         RETURNING id, tenant_id, name, email, role, created_at`,
+        [tenantId, name, email, passwordHash]
+      );
+
+      if (rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'E-mail já cadastrado.' });
+      }
 
       await client.query('COMMIT');
 
-      // A09: log estruturado de auditoria, sem senha, hash ou e-mail
-      console.info(
-        JSON.stringify({
-          evento: 'usuario.criado',
-          tenantId,
-          atorId,
-          usuarioId: rows[0].id,
-          ip: req.ip,
-          ts: new Date().toISOString(),
-        })
+      // 5. Auditoria sem dados sensíveis (A09)
+      log.info(
+        { event: 'user.created', actor: req.auth.userId, tenantId, newUserId: rows[0].id },
+        'Usuário criado'
       );
 
-      // 5) Resposta: nunca devolve senha_hash nem tenant_id
+      // 6. Resposta apenas com campos explícitos (nunca password_hash)
       const u = rows[0];
-      res.set('Cache-Control', 'no-store');
-      res.set('Location', `/api/usuarios/${u.id}`);
-      return res.status(201).json({
-        id: u.id,
-        nome: u.nome,
-        email: u.email,
-        papel: u.papel,
-        criadoEm: u.criado_em,
-      });
+      return res
+        .status(201)
+        .location(`/api/v1/users/${u.id}`)
+        .json({
+          id: u.id,
+          name: u.name,
+          email: u.email,
+          role: u.role,
+          createdAt: u.created_at,
+        });
     } catch (err) {
-      await client.query('ROLLBACK').catch(() => {});
-
-      // Violação do índice único (tenant_id, lower(email))
-      if (err.code === '23505') {
-        return res.status(409).json({ erro: 'E-mail já cadastrado nesta empresa.' });
-      }
-      return next(err);
+      if (client) await client.query('ROLLBACK').catch(() => {});
+      next(err);
     } finally {
-      client.release();
+      if (client) client.release();
     }
   }
 );
 
-// ---------------------------------------------------------------------------
-// App (A05: configuração segura)
-// ---------------------------------------------------------------------------
-const app = express();
-app.disable('x-powered-by');
-app.set('trust proxy', 1); // ajuste conforme sua infraestrutura (necessário p/ req.ip e rate limit)
-app.use(helmet());
-app.use(express.json({ limit: '10kb' })); // limita o tamanho do corpo
-app.use('/api/usuarios', router);
-
-// A09/A05: erro genérico ao cliente, detalhe apenas no log interno
-// eslint-disable-next-line no-unused-vars
+// ---------- Tratamento de erros (A05/A09): sem vazar stack ou detalhes internos ----------
 app.use((err, req, res, _next) => {
-  const idErro = crypto.randomUUID();
-  console.error(
-    JSON.stringify({ evento: 'erro.interno', idErro, mensagem: err.message, stack: err.stack })
-  );
-  res.status(500).json({ erro: 'Erro interno.', idErro });
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'JSON inválido.' });
+  }
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Requisição muito grande.' });
+  }
+  log.error({ err: { message: err.message, code: err.code }, path: req.path }, 'Erro interno');
+  res.status(500).json({ error: 'Erro interno do servidor.' });
 });
 
-module.exports = app;
+const port = Number(process.env.PORT) || 3000;
+app.listen(port, () => log.info(`API ouvindo na porta ${port}`));

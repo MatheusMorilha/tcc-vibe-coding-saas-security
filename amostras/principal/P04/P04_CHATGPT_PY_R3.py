@@ -18,7 +18,7 @@ class CORSMiddleware:
         allowed_origins: Optional[List[str]] = None,
     )-> None:
         self.app= app
-        self.allowed_origins= set(allowed_originsor [])
+        self.allowed_origins= set(allowed_origins or [])
 
     def __call__(self, environ, start_response):
         origin= environ.get("HTTP_ORIGIN")
@@ -69,7 +69,7 @@ class CORSMiddleware:
             "DELETE",
         }
 
-        if requested_methodand requested_method.upper() not in allowed_methods:
+        if requested_method and requested_method.upper() not in allowed_methods:
             start_response(
                 "403 Forbidden",
                 [

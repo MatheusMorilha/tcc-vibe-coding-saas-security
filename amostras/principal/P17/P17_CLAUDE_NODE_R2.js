@@ -1,182 +1,149 @@
+// routes/expenseApprovals.js
 'use strict';
 
 const express = require('express');
-const { Pool } = require('pg');
+const { z } = require('zod');
+const { pool } = require('../db');                      // pg.Pool
+const { authenticate } = require('../middlewares/auth'); // valida JWT e popula req.user
+const { requireActiveSubscription } = require('../middlewares/subscription');
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const router = express.Router();
 
-const UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+// ---------- Validação de entrada ----------
+const paramsSchema = z.object({
+  id: z.string().uuid(),
+});
 
-// Perfis autorizados a aprovar despesas (ajuste conforme o seu modelo de permissões)
-const APPROVER_ROLES = new Set(['admin', 'manager', 'finance']);
+const bodySchema = z.object({
+  comment: z.string().trim().max(500).optional(),
+});
 
-/**
- * Pressupõe que um middleware de autenticação anterior (ex.: validação de JWT)
- * já populou req.user = { id, tenantId, role } a partir de um token verificado.
- * O tenantId NUNCA vem do body, da query ou dos parâmetros da URL.
- */
-
-// ---------------------------------------------------------------------------
-// Middlewares
-// ---------------------------------------------------------------------------
-
-function requireApproverRole(req, res, next) {
-  if (!req.user || !APPROVER_ROLES.has(req.user.role)) {
-    return res.status(403).json({
-      error: 'forbidden',
-      message: 'Você não tem permissão para aprovar solicitações de despesa.',
-    });
-  }
-  next();
-}
-
-async function requireActiveSubscription(req, res, next) {
-  try {
-    const { rows } = await pool.query(
-      `SELECT 1
-         FROM subscriptions
-        WHERE tenant_id = $1
-          AND status = 'active'
-          AND (expires_at IS NULL OR expires_at > NOW())
-        LIMIT 1`,
-      [req.user.tenantId]
-    );
-    if (rows.length === 0) {
-      return res.status(402).json({
-        error: 'subscription_inactive',
-        message: 'O plano de assinatura da empresa não está ativo.',
-      });
-    }
-    next();
-  } catch (err) {
-    next(err);
-  }
-}
-
-// ---------------------------------------------------------------------------
+// ---------- Rota ----------
 // POST /api/v1/expense-requests/:id/approve
-// ---------------------------------------------------------------------------
-
 router.post(
   '/expense-requests/:id/approve',
-  requireApproverRole,
+  authenticate,
   requireActiveSubscription,
-  async (req, res, next) => {
-    const { id: userId, tenantId } = req.user;
-    const requestId = req.params.id;
+  async (req, res) => {
+    const parsedParams = paramsSchema.safeParse(req.params);
+    const parsedBody = bodySchema.safeParse(req.body ?? {});
 
-    if (!UUID_RE.test(requestId)) {
-      return res.status(400).json({
-        error: 'invalid_id',
-        message: 'Identificador da solicitação inválido.',
-      });
+    if (!parsedParams.success || !parsedBody.success) {
+      return res.status(400).json({ error: 'Dados da requisição inválidos.' });
     }
 
-    const comment =
-      typeof req.body?.comment === 'string' ? req.body.comment.trim() : null;
-    if (comment && comment.length > 500) {
-      return res.status(400).json({
-        error: 'invalid_comment',
-        message: 'O comentário deve ter no máximo 500 caracteres.',
-      });
+    const { id: expenseId } = parsedParams.data;
+    const { comment } = parsedBody.data;
+
+    // IMPORTANTE: tenant e usuário vêm SEMPRE do token autenticado,
+    // nunca do corpo, query string ou parâmetros da requisição.
+    const { id: userId, companyId, role } = req.user;
+
+    // Autorização por papel
+    const approverRoles = ['admin', 'finance_manager', 'manager'];
+    if (!approverRoles.includes(role)) {
+      return res.status(403).json({ error: 'Sem permissão para aprovar despesas.' });
     }
 
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
 
-      // 1) Busca e trava a linha, sempre filtrando pelo tenant do usuário.
-      //    Solicitações de outras empresas aparecem como "não encontradas".
+      // Trava a linha e filtra pelo tenant. Se a despesa pertencer a outra
+      // empresa, o resultado é idêntico a "não existe" (evita enumeração).
       const { rows } = await client.query(
-        `SELECT id, requester_id, status, amount
+        `SELECT id, requester_id, amount, status, approval_limit_required
            FROM expense_requests
           WHERE id = $1
-            AND tenant_id = $2
+            AND company_id = $2
           FOR UPDATE`,
-        [requestId, tenantId]
+        [expenseId, companyId]
       );
 
       if (rows.length === 0) {
         await client.query('ROLLBACK');
-        return res.status(404).json({
-          error: 'not_found',
-          message: 'Solicitação de despesa não encontrada.',
-        });
+        return res.status(404).json({ error: 'Solicitação não encontrada.' });
       }
 
       const expense = rows[0];
 
-      // 2) Segregação de funções: ninguém aprova a própria solicitação.
+      // Segregação de funções: ninguém aprova a própria despesa
       if (expense.requester_id === userId) {
         await client.query('ROLLBACK');
-        return res.status(403).json({
-          error: 'self_approval_not_allowed',
-          message: 'Você não pode aprovar a sua própria solicitação.',
-        });
+        return res
+          .status(403)
+          .json({ error: 'Você não pode aprovar a sua própria solicitação.' });
       }
 
-      // 3) Transição de estado válida: somente PENDING -> APPROVED.
-      if (expense.status !== 'PENDING') {
+      // Transição de estado válida somente a partir de "pending"
+      if (expense.status !== 'pending') {
         await client.query('ROLLBACK');
         return res.status(409).json({
-          error: 'invalid_state',
-          message: `A solicitação já está com status "${expense.status}" e não pode ser aprovada.`,
+          error: `Solicitação não pode ser aprovada no estado atual (${expense.status}).`,
         });
       }
 
-      // 4) Atualização (tenant_id e status repetidos na cláusula por defesa em profundidade).
-      const { rows: updated } = await client.query(
-        `UPDATE expense_requests
-            SET status = 'APPROVED',
-                approved_by = $3,
-                approved_at = NOW(),
-                updated_at = NOW()
+      // Alçada de aprovação do usuário (quando aplicável)
+      const limitResult = await client.query(
+        `SELECT approval_limit
+           FROM users
           WHERE id = $1
-            AND tenant_id = $2
-            AND status = 'PENDING'
-        RETURNING id, status, approved_by, approved_at`,
-        [requestId, tenantId, userId]
+            AND company_id = $2
+            AND active = true`,
+        [userId, companyId]
       );
 
-      if (updated.length === 0) {
+      if (limitResult.rows.length === 0) {
         await client.query('ROLLBACK');
-        return res.status(409).json({
-          error: 'conflict',
-          message: 'A solicitação foi alterada por outra operação. Tente novamente.',
-        });
+        return res.status(403).json({ error: 'Usuário inativo ou inválido.' });
       }
 
-      // 5) Trilha de auditoria na mesma transação.
+      const approvalLimit = limitResult.rows[0].approval_limit; // null = sem limite
+      if (approvalLimit !== null && Number(expense.amount) > Number(approvalLimit)) {
+        await client.query('ROLLBACK');
+        return res
+          .status(403)
+          .json({ error: 'Valor acima da sua alçada de aprovação.' });
+      }
+
+      // Atualização do estado (mantém o filtro de tenant por defesa em profundidade)
+      const updated = await client.query(
+        `UPDATE expense_requests
+            SET status      = 'approved',
+                approved_by = $1,
+                approved_at = NOW(),
+                updated_at  = NOW()
+          WHERE id = $2
+            AND company_id = $3
+            AND status = 'pending'
+        RETURNING id, status, approved_by, approved_at`,
+        [userId, expenseId, companyId]
+      );
+
+      // Trilha de auditoria
       await client.query(
         `INSERT INTO audit_logs
-           (tenant_id, actor_id, entity_type, entity_id, action, details, ip_address, created_at)
-         VALUES ($1, $2, 'expense_request', $3, 'APPROVED', $4, $5, NOW())`,
+           (company_id, user_id, entity, entity_id, action, details, ip, created_at)
+         VALUES ($1, $2, 'expense_request', $3, 'approve', $4, $5, NOW())`,
         [
-          tenantId,
+          companyId,
           userId,
-          requestId,
-          JSON.stringify({
-            previous_status: 'PENDING',
-            new_status: 'APPROVED',
-            amount: expense.amount,
-            comment,
-          }),
+          expenseId,
+          JSON.stringify({ comment: comment ?? null, previous_status: 'pending' }),
           req.ip,
         ]
       );
 
       await client.query('COMMIT');
 
+      const result = updated.rows[0];
       return res.status(200).json({
-        success: true,
         message: 'Solicitação de despesa aprovada com sucesso.',
         data: {
-          id: updated[0].id,
-          status: updated[0].status,
-          approvedBy: updated[0].approved_by,
-          approvedAt: updated[0].approved_at,
+          id: result.id,
+          status: result.status,
+          approvedBy: result.approved_by,
+          approvedAt: result.approved_at,
         },
       });
     } catch (err) {
@@ -185,7 +152,12 @@ router.post(
       } catch (_) {
         /* ignora falha no rollback */
       }
-      next(err);
+      console.error('[expense-approve] erro:', {
+        expenseId,
+        companyId,
+        message: err.message,
+      });
+      return res.status(500).json({ error: 'Erro interno ao processar a aprovação.' });
     } finally {
       client.release();
     }
@@ -194,14 +166,28 @@ router.post(
 
 module.exports = router;
 
-// ---------------------------------------------------------------------------
-// Exemplo de uso no app principal:
-//
-// const app = express();
-// app.use(express.json({ limit: '10kb' }));
-// app.use('/api/v1', authenticate, expenseRoutes); // authenticate preenche req.user
-// app.use((err, req, res, _next) => {
-//   console.error(err);
-//   res.status(500).json({ error: 'internal_error', message: 'Erro interno.' });
-// });
-// ---------------------------------------------------------------------------
+// middlewares/subscription.js
+'use strict';
+const { pool } = require('../db');
+
+async function requireActiveSubscription(req, res, next) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT 1
+         FROM subscriptions
+        WHERE company_id = $1
+          AND status = 'active'
+          AND (expires_at IS NULL OR expires_at > NOW())
+        LIMIT 1`,
+      [req.user.companyId]
+    );
+    if (rows.length === 0) {
+      return res.status(402).json({ error: 'Assinatura inativa ou expirada.' });
+    }
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { requireActiveSubscription };

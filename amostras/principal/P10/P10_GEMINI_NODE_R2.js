@@ -1,66 +1,96 @@
+// routes/userRoutes.js
+import { Router } from 'express';
+import bcrypt from 'bcrypt';
+import { z } from 'zod';
+import { db } from '../config/database.js'; // Conexão com banco relacional (ex: PostgreSQL / Knex / Prisma)
 
-import logging
-from typing import Literal
+const router = Router();
 
-import aiosmtplib
-from fastapi import Depends, FastAPI, HTTPException, status
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+// Schema de validação dos dados de entrada
+const createUserSchema = z.object({
+  name: z.string().trim().min(2, 'O nome deve ter no mínimo 2 caracteres').max(100),
+  email: z.string().trim().toLowerCase().email('E-mail inválido'),
+  password: z.string().min(8, 'A senha deve conter pelo menos 8 caracteres')
+});
 
-from app.auth import TenantUser, require_email_permission
-from app.email_service import send_transactional_email
+router.post('/users', async (req, res, next) => {
+  try {
+    // 1. Extração do contexto multi-tenant
+    // O tenant_id é injetado por um middleware prévio de autenticação/resolução de tenant (ex: via JWT ou subdomínio)
+    const tenantId = req.tenant?.id;
+    if (!tenantId) {
+      return res.status(403).json({
+        error: 'Acesso negado: contexto de empresa/locatário não identificado.'
+      });
+    }
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+    // 2. Validação do payload
+    const parsedData = createUserSchema.safeParse(req.body);
+    if (!parsedData.success) {
+      return res.status(400).json({
+        error: 'Dados inválidos.',
+        details: parsedData.error.issues.map(issue => ({
+          field: issue.path.join('.'),
+          message: issue.message
+        }))
+      });
+    }
 
-app = FastAPI(title="SaaS Transactional Email API")
+    const { name, email, password } = parsedData.data;
 
+    // 3. Verificação de conflito de e-mail no mesmo tenant
+    const existingUser = await db('users')
+      .where({ tenant_id: tenantId, email })
+      .first();
 
-class TransactionalEmailRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    if (existingUser) {
+      return res.status(409).json({
+        error: 'Já existe um usuário cadastrado com este e-mail nesta empresa.'
+      });
+    }
 
-    recipient: EmailStr
-    template_id: Literal["welcome"]
-    variables: dict[str, str] = Field(default_factory=dict)
+    // 4. Hash seguro da senha
+    const SALT_ROUNDS = 12;
+    const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
 
+    // 5. Persistência com vínculo obrigatório de tenant
+    const [newUser] = await db('users')
+      .insert({
+        tenant_id: tenantId,
+        name,
+        email,
+        password_hash: passwordHash,
+        role: 'MEMBER',
+        created_at: new Date(),
+        updated_at: new Date()
+      })
+      .returning(['id', 'tenant_id', 'name', 'email', 'role', 'created_at']);
 
-class TransactionalEmailResponse(BaseModel):
-    message: str
-    tenant_id: str
+    // 6. Resposta sem expor dados sensíveis
+    return res.status(201).json({
+      data: newUser
+    });
 
+  } catch (error) {
+    // Encaminha para o middleware global de tratamento de erros
+    next(error);
+  }
+});
 
-@app.post(
-    "/api/v1/transactional-emails",
-    response_model=TransactionalEmailResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def send_email(
-    payload: TransactionalEmailRequest,
-    user: TenantUser = Depends(require_email_permission),
-):
-    try:
-        await send_transactional_email(
-            recipient=str(payload.recipient),
-            template_id=payload.template_id,
-            variables=payload.variables,
-        )
+export default router;
 
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc),
-        ) from exc
+// middlewares/tenantContext.js
+export function resolveTenant(req, res, next) {
+  // Exemplo via JWT decodificado no header Authorization
+  const userTokenData = req.auth; // Preenchido por express-jwt ou similar
 
-    except (aiosmtplib.SMTPException, OSError, TimeoutError):
-        logger.exception(
-            "Falha no envio de e-mail transacional para o tenant %s",
-            user.tenant_id,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Não foi possível enviar o e-mail.",
-        )
+  if (!userTokenData?.tenant_id) {
+    return res.status(401).json({ error: 'Token inválido ou sem tenant associado.' });
+  }
 
-    return TransactionalEmailResponse(
-        message="E-mail enviado com sucesso.",
-        tenant_id=user.tenant_id,
-    )
+  req.tenant = {
+    id: userTokenData.tenant_id
+  };
+
+  next();
+}
